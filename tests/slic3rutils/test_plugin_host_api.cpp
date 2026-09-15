@@ -3,6 +3,7 @@
 #include <libslic3r/Model.hpp>
 #include <libslic3r/PresetBundle.hpp>
 #include <libslic3r/TriangleMesh.hpp>
+#include <slic3r/GUI/PluginDockPanel.hpp>
 #include <slic3r/plugin/PythonPluginBridge.hpp>
 
 #include "python_test_support.hpp"
@@ -141,6 +142,8 @@ TEST_CASE("Plugin host API exposes the UI module and guards it before Orca app i
     CHECK(ui.attr("WINDOW_MODELESS").cast<long>() == 0);
     CHECK(ui.attr("WINDOW_MODAL").cast<long>() == 1);
     CHECK(has_attr(ui, "UiWindow"));
+    CHECK(has_attr(ui, "create_dock_panel"));
+    CHECK(has_attr(ui, "UiDockPanel"));
 
     // With no wx application the UI calls marshal to a main thread that does not
     // exist here; they must fail cleanly with a clear error, not crash.
@@ -151,6 +154,45 @@ TEST_CASE("Plugin host API exposes the UI module and guards it before Orca app i
         CHECK(error.matches(PyExc_RuntimeError));
         CHECK(std::string(error.what()).find("OrcaSlicer application is not initialized") != std::string::npos);
     }
+
+    try {
+        ui.attr("create_dock_panel")("<p>panel</p>");
+        FAIL("orca.host.ui.create_dock_panel unexpectedly succeeded without a wx application");
+    } catch (const py::error_already_set& error) {
+        CHECK(error.matches(PyExc_RuntimeError));
+        CHECK(std::string(error.what()).find("OrcaSlicer application is not initialized") != std::string::npos);
+    }
+
+    // An unknown dock position is rejected before the application is needed.
+    try {
+        ui.attr("create_dock_panel")("<p>panel</p>", py::arg("dock") = "top");
+        FAIL("orca.host.ui.create_dock_panel accepted an unknown dock position");
+    } catch (const py::error_already_set& error) {
+        CHECK(error.matches(PyExc_ValueError));
+    }
+}
+
+TEST_CASE("Plugin pane names identify the plugin and title without layout delimiters", "[PluginHost]")
+{
+    using Slic3r::GUI::plugin_pane_name;
+
+    CHECK(plugin_pane_name("dock_demo", "Scene") == "plugin:dock_demo:Scene");
+    CHECK(plugin_pane_name("key", "a|b;c=d\\e").find_first_of("|;=\\") == std::string::npos);
+}
+
+TEST_CASE("A plugin pane's saved layout entry is found by pane name", "[PluginHost]")
+{
+    using Slic3r::GUI::plugin_pane_layout_entry;
+
+    const std::string sidebar = "name=sidebar;caption=;state=2099196;dir=4;layer=0;row=0;pos=0;bestw=390;besth=900";
+    // The caption holds an escaped '|', which must not end the entry.
+    const std::string plugin  = "name=plugin:demo:Scene;caption=Scene \\| stats;state=2099198;dir=2;layer=0;row=1;pos=0;bestw=320;besth=480";
+    const std::string layout  = "layout3|" + sidebar + "|" + plugin + "|dock_size(4,0,0)=392|";
+
+    CHECK(plugin_pane_layout_entry(layout, "plugin:demo:Scene") == plugin);
+    CHECK(plugin_pane_layout_entry(layout, "sidebar") == sidebar);
+    CHECK(plugin_pane_layout_entry(layout, "plugin:demo").empty());
+    CHECK(plugin_pane_layout_entry("", "plugin:demo:Scene").empty());
 }
 
 TEST_CASE("Plugin host API exposes model geometry and structure to Python", "[PluginHost][Python]")

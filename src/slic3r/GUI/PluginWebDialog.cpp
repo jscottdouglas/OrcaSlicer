@@ -57,6 +57,10 @@ wxString web_base_url()
 
 } // namespace
 
+const char* PluginWebDialog::bridge_user_script() { return ORCA_BRIDGE_JS; }
+
+wxString PluginWebDialog::content_base_url() { return web_base_url(); }
+
 PluginWebDialog::PluginWebDialog(wxWindow*          parent,
                                  const wxString&    title,
                                  const std::string& html,
@@ -75,7 +79,7 @@ PluginWebDialog::PluginWebDialog(wxWindow*          parent,
 {
     // A tiny bundled bootstrap page brings the webview up; the real plugin HTML
     // is swapped in via SetPage once the bootstrap finishes loading.
-    create_webview("web/dialog/PluginWebDialog/blank.html", title, size, wxSize(320, 240));
+    create_webview(BOOTSTRAP_PAGE, title, size, wxSize(320, 240));
 
     // Paint the window/webview in the themed background so there is no white
     // flash before the (transparent) bootstrap page and plugin HTML render.

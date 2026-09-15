@@ -47,6 +47,12 @@ public:
     static void request_close(PluginWebDialog* dialog);
     static void destroy_for_plugin(PluginWebDialog* dialog);
 
+    // Shared with PluginDockPanel: the bundled blank page a plugin web view loads before the plugin
+    // HTML is swapped in, the window.orca bridge, and the base URL the plugin HTML is loaded against.
+    static constexpr const char* BOOTSTRAP_PAGE = "web/dialog/PluginWebDialog/blank.html";
+    static const char*           bridge_user_script();
+    static wxString              content_base_url();
+
     // Push a payload to the page; delivered to handlers registered via
     // window.orca.onMessage(). MAIN-THREAD ONLY (the plugin layer marshals).
     void push_message(const nlohmann::json& data);
