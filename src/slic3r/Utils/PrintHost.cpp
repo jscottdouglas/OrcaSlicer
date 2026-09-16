@@ -37,6 +37,7 @@
 #include "MKS.hpp"
 #include "ESP3D.hpp"
 #include "CrealityPrint.hpp"
+#include "CrealityCFS.hpp"
 #include "../GUI/PrintHostDialogs.hpp"
 #include "../GUI/MainFrame.hpp"
 #include "slic3r/plugin/PluginManager.hpp"
@@ -88,6 +89,7 @@ PrintHost* PrintHost::get_print_host(DynamicPrintConfig *config)
             case htElegooLink: return new ElegooLink(config);
             case ht3DPrinterOS: return new C3DPrinterOS(config);
             case htMoonraker: return new Moonraker(config);
+            case htCrealityCFS: return new CrealityCFS(config);
             default:          return nullptr;
         }
     } else {
@@ -107,6 +109,15 @@ std::string PrintHost::get_print_host_webui(DynamicPrintConfig* config)
     switch (host_type) {
     case htElegooLink: {
         webui_url = ElegooLink::get_print_host_webui(config);
+        break;
+    }
+    case htCrealityCFS: {
+        // With "Device UI" empty this returns a file: URL for a generated camera
+        // page (the K2 camera is WebRTC behind Creality's own signalling, which
+        // no third party web UI speaks), with Fluidd on port 4408 embedded
+        // underneath it. There is no port or file logic anywhere else in this
+        // function, so the default has to be built here.
+        webui_url = CrealityCFS::get_print_host_webui(config);
         break;
     }
     default: break;
