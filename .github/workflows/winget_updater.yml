@@ -4,6 +4,8 @@ on:
     types: [ released ]
 jobs:
   publish:
+    # Upstream-only: this fork does not publish itself to WinGet.
+    if: github.repository == 'OrcaSlicer/OrcaSlicer'
     runs-on: windows-latest
     steps:
       - uses: vedantmgoyal9/winget-releaser@main

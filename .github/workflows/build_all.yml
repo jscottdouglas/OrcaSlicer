@@ -6,6 +6,11 @@ on:
      - main
      - release/*
      - belt-printer
+     # This fork's branch.
+     - cfs
+    # Release tags (v<upstream>-cfs.<n>) build the fork's published assets.
+    tags:
+     - 'v*'
     paths:
      - 'deps/**'
      - 'src/**'

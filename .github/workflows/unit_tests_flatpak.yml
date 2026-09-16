@@ -17,6 +17,8 @@ on:
 jobs:
   unit_tests_flatpak:
     name: Flatpak Unit Tests
+    # Upstream-only: this fork does not run the upstream test suite in CI.
+    if: github.repository == 'OrcaSlicer/OrcaSlicer'
     runs-on: ${{ inputs.os }}
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50

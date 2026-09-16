@@ -1,0 +1,27 @@
+name: privacy scan
+
+# Gate on the fork's own additions only. Upstream's sources and history trip the
+# generic credential and email patterns, so the scan is pointed at the files this
+# fork adds and at the fork's commit range rather than at whole directories.
+on: [push, pull_request]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # --git walks the commit range, so the full history has to be present.
+          fetch-depth: 0
+      - name: Scan the fork's sources
+        run: |
+          python3 scripts/privacy_scan.py --root src/slic3r/Utils/CrealityCFS.cpp
+          python3 scripts/privacy_scan.py --root src/slic3r/Utils/CrealityCFS.hpp
+      # Authors, messages and added lines of the fork's commits, so anything
+      # committed and later deleted is still caught. The range starts at the
+      # upstream commit this fork branched from, kept in scripts/fork_base.txt.
+      # --root only decides which repo to read the history from; pointing it at
+      # that one-line file avoids re-scanning a source file the step above
+      # already covered.
+      - name: Scan the fork's commit range
+        run: python3 scripts/privacy_scan.py --root scripts/fork_base.txt --git --git-since "$(cat scripts/fork_base.txt)"
