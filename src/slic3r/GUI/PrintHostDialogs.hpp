@@ -13,6 +13,7 @@
 #include "MsgDialog.hpp"
 #include "../Utils/PrintHost.hpp"
 #include "../Utils/Flashforge.hpp"
+#include "../Utils/CrealityCFS.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/ProjectTask.hpp"
 class wxButton;
@@ -217,6 +218,51 @@ private:
     };
     std::vector<SlotInfo>   m_printer_slots;
     std::vector<BitmapComboBox*> m_slot_combos; // one per gcode filament
+};
+
+// Orca CFS fork: the send dialog for the "Creality CFS (K2)" host type.
+//
+// It reads the live CFS slot table off the printer (boxsInfo over the port 9999
+// LAN socket, merged with Moonraker's box object), auto maps every filament the
+// plate actually uses to a compatible slot, lets the user override, and warns
+// about a slot assigned twice, a unit that is not connected, a type mismatch,
+// an untagged slot, and a slot that is nearly empty.
+//
+// The accepted mapping leaves here as a JSON array in extended_info, which
+// CrealityCFS::upload() turns into the printer's colorMatch message.
+class CfsPrintHostSendDialog : public PrintHostSendDialog
+{
+public:
+    CfsPrintHostSendDialog(const boost::filesystem::path& path,
+                           PrintHostPostUploadActions     post_actions,
+                           const wxArrayString&           groups,
+                           const wxArrayString&           storage_paths,
+                           const wxArrayString&           storage_names,
+                           bool                           switch_to_device_tab,
+                           PrintHost*                     printhost);
+
+    virtual void                               init() override;
+    virtual std::map<std::string, std::string> extendedInfo() const override;
+
+private:
+    static constexpr const char* CONFIG_KEY_CFS_SELFTEST = "crealitycfs_enable_self_test";
+
+    void refresh_warnings();
+    int  auto_pick(int tool_index, const std::vector<int>& already_taken) const;
+
+    PrintHost*    m_printhost;
+    bool          m_self_test = false;
+    wxStaticText* m_warning_text = nullptr;
+
+    // Index i of each vector belongs to the i-th row, that is to G-code tool
+    // m_tool_index[i].
+    std::vector<int>             m_tool_index;      // 0-based Orca tool number
+    std::vector<std::string>     m_tool_type;       // sliced filament type
+    std::vector<std::string>     m_tool_colour;     // sliced filament colour
+    std::vector<BitmapComboBox*> m_slot_combos;
+
+    // Every slot offered in the combos, in combo order.
+    std::vector<CfsSlot> m_offered;
 };
 
 class FlashforgePrintHostSendDialog : public PrintHostSendDialog

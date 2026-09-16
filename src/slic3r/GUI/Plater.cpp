@@ -19558,6 +19558,13 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
             pDlg = std::make_unique<ElegooPrintHostSendDialog>(default_output_file, upload_job.printhost->get_post_upload_actions(), groups,
                                                                storage_paths, storage_names,
                                                                config->get_bool("open_device_tab_post_upload"));
+        } else if (host_type == htCrealityCFS) {
+            // Orca CFS fork: the CFS slot table and the filament mapping live in
+            // their own dialog, which writes the accepted mapping into extended_info.
+            pDlg = std::make_unique<CfsPrintHostSendDialog>(default_output_file, upload_job.printhost->get_post_upload_actions(),
+                                                            groups, storage_paths, storage_names,
+                                                            config->get_bool("open_device_tab_post_upload"),
+                                                            upload_job.printhost.get());
         } else if (host_type == htCrealityPrint) {
             pDlg = std::make_unique<CrealityPrintHostSendDialog>(default_output_file, upload_job.printhost->get_post_upload_actions(), groups,
                                                                  storage_paths, storage_names,

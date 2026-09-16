@@ -159,7 +159,7 @@ void PhysicalPrinterDialog::build_printhost_settings(ConfigOptionsGroup* m_optgr
             // per-device-unique service type _Creality-<MAC-hex>._udp, so the
             // standard fixed-service-name Bonjour browser does not find them.
             // Dispatch to the Creality-specific scanner instead.
-            if (host_type == htCrealityPrint) {
+            if (host_type == htCrealityPrint || host_type == htCrealityCFS) {
                 CrealityDiscoveryDialog dialog(this);
                 if (dialog.ShowModal() == wxID_OK && !dialog.selected_ip().empty()) {
                     // set_value expects the value wrapped as wxString -- TextCtrl::set_value
@@ -704,6 +704,15 @@ void PhysicalPrinterDialog::update(bool printer_change)
             m_optgroup->hide_field("printhost_authorization_type");
         } else {
             m_optgroup->hide_field("flashforge_serial_number");
+        }
+
+        // Orca CFS fork: the K2 LAN protocol has no authentication of any kind,
+        // so an API key, an authorization type and a CA file are all meaningless
+        // here and only invite a wrong setup.
+        if (opt->value == htCrealityCFS) {
+            m_optgroup->hide_field("printhost_apikey");
+            m_optgroup->hide_field("printhost_authorization_type");
+            m_optgroup->hide_field("printhost_cafile");
         }
     }
     else {

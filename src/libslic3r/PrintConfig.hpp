@@ -98,7 +98,11 @@ enum class WipeTowerType {
 };
 
 enum PrintHostType {
-    htPrusaLink, htPrusaConnect, htOctoPrint, htDuet, htFlashAir, htAstroBox, htRepetier, htMKS, htESP3D, htCrealityPrint, htObico, htFlashforge, htSimplyPrint, htElegooLink, ht3DPrinterOS, htMoonraker
+    htPrusaLink, htPrusaConnect, htOctoPrint, htDuet, htFlashAir, htAstroBox, htRepetier, htMKS, htESP3D, htCrealityPrint, htObico, htFlashforge, htSimplyPrint, htElegooLink, ht3DPrinterOS, htMoonraker,
+    // Orca CFS fork: new enumerators must be appended at the end. PhysicalPrinterDialog
+    // casts the combo index straight to this enum, so inserting anywhere else would
+    // silently reassign every saved host_type.
+    htCrealityCFS
 };
 
 enum AuthorizationType {

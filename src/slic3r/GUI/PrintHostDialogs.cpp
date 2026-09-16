@@ -36,8 +36,12 @@
 #include "ExtraRenderers.hpp"
 #include "format.hpp"
 #include "../Utils/CrealityPrint.hpp"
+#include "../Utils/CrealityCFS.hpp"
 #include "BitmapComboBox.hpp"
 #include "wxExtensions.hpp"
+#include "Plater.hpp"
+#include "PartPlate.hpp"
+#include "libslic3r/PresetBundle.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -2102,6 +2106,373 @@ std::map<std::string, std::string> CrealityPrintHostSendDialog::extendedInfo() c
                 std::to_string(slot.box_id) + "\t" + std::to_string(slot.material_id);
         }
     }
+
+    return info;
+}
+
+// ---------------------------------------------------------------------------
+// Orca CFS fork: CfsPrintHostSendDialog
+// ---------------------------------------------------------------------------
+
+CfsPrintHostSendDialog::CfsPrintHostSendDialog(const fs::path&            path,
+                                               PrintHostPostUploadActions post_actions,
+                                               const wxArrayString&       groups,
+                                               const wxArrayString&       storage_paths,
+                                               const wxArrayString&       storage_names,
+                                               bool                       switch_to_device_tab,
+                                               PrintHost*                 printhost)
+    : PrintHostSendDialog(path, post_actions, groups, storage_paths, storage_names, switch_to_device_tab)
+    , m_printhost(printhost)
+{}
+
+// Lower is better. Type is the hard gate: a PETG job never lands in a PLA slot.
+// Within the compatible slots colour decides, and the Creality material id only
+// breaks ties.
+static bool cfs_score(const std::string& want_type,
+                      const std::string& want_colour,
+                      const std::string& want_filament_id,
+                      const CfsSlot&     slot,
+                      int&               tier,
+                      double&            distance,
+                      int&               id_rank)
+{
+    std::string wt = want_type, ht = slot.type;
+    boost::to_upper(wt);
+    boost::to_upper(ht);
+    boost::trim(wt);
+    boost::trim(ht);
+
+    distance = CrealityCFS::colour_distance(want_colour, slot.colour);
+
+    std::string a = want_filament_id, b = slot.rfid;
+    boost::trim_left_if(a, boost::is_any_of("0"));
+    boost::trim_left_if(b, boost::is_any_of("0"));
+    const bool same_id = !a.empty() && !b.empty() && a == b;
+    id_rank = same_id ? 0 : 1;
+
+    if (!wt.empty() && !ht.empty() && wt == ht) {
+        tier = 0;
+        return true;
+    }
+    if (same_id) {
+        tier = 1;
+        return true;
+    }
+    tier = 9; // type mismatch, never auto picked
+    return false;
+}
+
+int CfsPrintHostSendDialog::auto_pick(int row, const std::vector<int>& already_taken) const
+{
+    int    best       = -1;
+    int    best_tier  = 99;
+    double best_dist  = 1e18;
+    int    best_id    = 9;
+
+    for (int s = 0; s < (int) m_offered.size(); s++) {
+        if (std::find(already_taken.begin(), already_taken.end(), s) != already_taken.end())
+            continue;
+        int    tier = 9, id_rank = 1;
+        double dist = 1e6;
+        if (!cfs_score(m_tool_type[row], m_tool_colour[row], std::string(), m_offered[s], tier, dist, id_rank))
+            continue;
+        if (tier < best_tier || (tier == best_tier && dist < best_dist) ||
+            (tier == best_tier && dist == best_dist && id_rank < best_id)) {
+            best      = s;
+            best_tier = tier;
+            best_dist = dist;
+            best_id   = id_rank;
+        }
+    }
+    return best;
+}
+
+void CfsPrintHostSendDialog::refresh_warnings()
+{
+    if (m_warning_text == nullptr)
+        return;
+
+    std::vector<wxString> warnings;
+    std::map<int, int>    seen; // offered slot index -> row that took it
+
+    for (int i = 0; i < (int) m_slot_combos.size(); i++) {
+        const int sel = m_slot_combos[i]->GetSelection();
+        if (sel < 0 || sel >= (int) m_offered.size())
+            continue;
+        const CfsSlot& slot = m_offered[sel];
+
+        auto dup = seen.find(sel);
+        if (dup != seen.end())
+            warnings.push_back(wxString::Format(_L("Slot %s is assigned to both filament %d and filament %d. "
+                                                   "The printer cannot feed one slot to two tools at once."),
+                                                wxString::FromUTF8(slot.label().c_str()), dup->second + 1, i + 1));
+        seen[sel] = i;
+
+        if (!slot.is_external() && !slot.present)
+            warnings.push_back(wxString::Format(_L("Slot %s is empty. Load it, or set its material on the touchscreen."),
+                                                wxString::FromUTF8(slot.label().c_str())));
+
+        std::string wt = m_tool_type[i], ht = slot.type;
+        boost::to_upper(wt);
+        boost::to_upper(ht);
+        if (!wt.empty() && !ht.empty() && wt != ht)
+            warnings.push_back(wxString::Format(_L("Filament %d is sliced for %s but slot %s holds %s."), i + 1,
+                                                wxString::FromUTF8(m_tool_type[i].c_str()),
+                                                wxString::FromUTF8(slot.label().c_str()),
+                                                wxString::FromUTF8(slot.type.c_str())));
+
+        if (slot.edited)
+            warnings.push_back(wxString::Format(_L("Slot %s has no RFID tag, so its material was set by hand and the "
+                                                   "remaining length is not tracked."),
+                                                wxString::FromUTF8(slot.label().c_str())));
+
+        if (slot.remain_len >= 0.0 && slot.remain_len < 1.0)
+            warnings.push_back(wxString::Format(_L("Slot %s reports only %.1f m remaining."),
+                                                wxString::FromUTF8(slot.label().c_str()), slot.remain_len));
+    }
+
+    wxString text;
+    for (size_t i = 0; i < warnings.size(); i++) {
+        if (i > 0)
+            text += "\n";
+        text += "! " + warnings[i];
+    }
+    m_warning_text->SetLabel(text);
+    m_warning_text->Show(!text.IsEmpty());
+    m_warning_text->Wrap(FromDIP(420));
+    this->Layout();
+    this->Fit();
+}
+
+void CfsPrintHostSendDialog::init()
+{
+    PrintHostSendDialog::init();
+
+    auto* cfs = dynamic_cast<CrealityCFS*>(m_printhost);
+    if (cfs == nullptr)
+        return;
+
+    CfsSlotTable table;
+    std::string  error;
+    bool         ok = false;
+    {
+        wxBusyCursor wait;
+        ok = cfs->query_slot_table(table, error);
+    }
+
+    auto* group_box = new wxStaticBox(this, wxID_ANY,
+        ok ? wxString::Format(_L("Creality CFS: %s"),
+                              wxString::FromUTF8((table.model_name.empty() ? cfs->bare_host() : table.model_name).c_str()))
+           : _L("Creality CFS"));
+    auto* group_sizer = new wxStaticBoxSizer(group_box, wxVERTICAL);
+    content_sizer->Add(group_sizer, 0, wxEXPAND);
+
+    if (!ok) {
+        auto* err = new wxStaticText(this, wxID_ANY,
+            wxString::Format(_L("Could not read the CFS slots: %s\nThe file will still be uploaded, and the printer "
+                                "will use whatever slot mapping it already has."),
+                             wxString::FromUTF8(error.c_str())));
+        err->SetFont(::Label::Body_13);
+        err->Wrap(FromDIP(420));
+        group_sizer->Add(err, 0, wxALL, FromDIP(4));
+        this->Layout();
+        this->Fit();
+        return;
+    }
+
+    // Calibration checkbox.
+    {
+        const AppConfig* app_config = wxGetApp().app_config;
+        std::string      saved      = app_config->get("recent", CONFIG_KEY_CFS_SELFTEST);
+        if (!saved.empty()) {
+            try {
+                m_self_test = std::stoi(saved) != 0;
+            } catch (...) {}
+        }
+
+        auto* checkbox_sizer = new wxBoxSizer(wxHORIZONTAL);
+        auto* checkbox       = new ::CheckBox(this);
+        checkbox->SetValue(m_self_test);
+        checkbox->Bind(wxEVT_TOGGLEBUTTON, [this](wxCommandEvent& e) {
+            m_self_test = e.IsChecked();
+            wxGetApp().app_config->set("recent", CONFIG_KEY_CFS_SELFTEST, m_self_test ? "1" : "0");
+            e.Skip();
+        });
+        checkbox_sizer->Add(checkbox, 0, wxALL | wxALIGN_CENTER, FromDIP(2));
+        auto* checkbox_text = new wxStaticText(this, wxID_ANY, _L("Calibrate before printing"));
+        checkbox_text->SetFont(::Label::Body_13);
+        checkbox_text->SetForegroundColour(StateColor::darkModeColorFor(wxColour("#323A3D")));
+        checkbox_sizer->Add(checkbox_text, 0, wxALL | wxALIGN_CENTER, FromDIP(2));
+        group_sizer->Add(checkbox_sizer);
+        group_sizer->AddSpacer(VERT_SPACING);
+    }
+
+    // Which slots can be offered. An empty slot is never a valid target, so it is
+    // not offered at all rather than offered and then warned about.
+    for (const auto& s : table.slots) {
+        if (s.is_external()) {
+            // The spool holder is only usable when something is actually on it, and
+            // choosing it makes the job a plain single colour print.
+            if (s.present && !s.type.empty())
+                m_offered.push_back(s);
+            continue;
+        }
+        if (table.units_present.count(s.unit) == 0)
+            continue;
+        if (!s.present || s.type.empty())
+            continue;
+        m_offered.push_back(s);
+    }
+
+    // Which filaments the plate actually uses. Mapping every filament in the
+    // project would force loads the job never asks for.
+    auto        preset_bundle = wxGetApp().preset_bundle;
+    auto        full_config   = preset_bundle->full_config();
+    const auto* colours       = full_config.option<ConfigOptionStrings>("filament_colour");
+    const auto* types         = full_config.option<ConfigOptionStrings>("filament_type");
+
+    std::vector<int> used;
+    try {
+        if (PartPlate* plate = wxGetApp().plater()->get_partplate_list().get_curr_plate(); plate != nullptr)
+            for (int e : plate->get_extruders(true))
+                if (e >= 1)
+                    used.push_back(e - 1); // get_extruders() is 1 based
+    } catch (...) {}
+    std::sort(used.begin(), used.end());
+    used.erase(std::unique(used.begin(), used.end()), used.end());
+    if (used.empty() && colours != nullptr)
+        for (int i = 0; i < (int) colours->values.size(); i++)
+            used.push_back(i);
+
+    for (int tool : used) {
+        m_tool_index.push_back(tool);
+        m_tool_type.push_back(types != nullptr && tool < (int) types->values.size() ? types->values[tool] : std::string());
+        m_tool_colour.push_back(colours != nullptr && tool < (int) colours->values.size() ? colours->values[tool]
+                                                                                         : std::string("#FFFFFF"));
+    }
+
+    if (m_offered.empty()) {
+        auto* err = new wxStaticText(this, wxID_ANY,
+            _L("No CFS slot reports any filament. Load a spool, or set the slot material on the touchscreen, then "
+               "reopen this dialog. The file will still be uploaded."));
+        err->SetFont(::Label::Body_13);
+        err->Wrap(FromDIP(420));
+        group_sizer->Add(err, 0, wxALL, FromDIP(4));
+        this->Layout();
+        this->Fit();
+        return;
+    }
+
+    auto* label = new wxStaticText(this, wxID_ANY, _L("Filament mapping:"));
+    label->SetFont(::Label::Body_13);
+    label->SetForegroundColour(StateColor::darkModeColorFor(wxColour("#323A3D")));
+    group_sizer->Add(label);
+    group_sizer->AddSpacer(4);
+
+    const int icon_sz = FromDIP(16);
+
+    std::vector<int> taken;
+    for (int row = 0; row < (int) m_tool_index.size(); row++) {
+        auto* row_sizer = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* swatch = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(icon_sz, icon_sz));
+        swatch->SetBackgroundColour(wxColour(m_tool_colour[row]));
+        swatch->SetMinSize(wxSize(icon_sz, icon_sz));
+        row_sizer->Add(swatch, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+
+        auto* tool_label = new wxStaticText(this, wxID_ANY,
+            wxString::Format("%d (%s) %s", m_tool_index[row] + 1, wxString::FromUTF8(m_tool_type[row].c_str()),
+                             wxString::FromUTF8(CrealityCFS::index_to_tnn(m_tool_index[row]).c_str())));
+        tool_label->SetFont(::Label::Body_13);
+        tool_label->SetForegroundColour(StateColor::darkModeColorFor(wxColour("#323A3D")));
+        tool_label->SetMinSize(wxSize(FromDIP(120), -1));
+        row_sizer->Add(tool_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+
+        auto* arrow = new wxStaticText(this, wxID_ANY, wxString::FromUTF8("\xe2\x86\x92"));
+        arrow->SetFont(::Label::Body_13);
+        row_sizer->Add(arrow, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+
+        auto* combo = new BitmapComboBox(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, 0, nullptr,
+                                         wxCB_READONLY);
+        for (const auto& slot : m_offered) {
+            wxBitmap* bmp = get_extruder_color_icon(slot.colour.empty() ? std::string("#FFFFFF") : slot.colour, "",
+                                                    icon_sz, icon_sz);
+            wxString text = wxString::Format("%s  %s", wxString::FromUTF8(slot.label().c_str()),
+                                             wxString::FromUTF8(slot.type.c_str()));
+            if (!slot.name.empty())
+                text += "  " + wxString::FromUTF8(slot.name.c_str());
+            else if (!slot.vendor.empty())
+                text += "  " + wxString::FromUTF8(slot.vendor.c_str());
+            if (slot.remain_len >= 0.0)
+                text += wxString::Format("  %.0f m", slot.remain_len);
+            if (slot.edited)
+                text += _L("  (set by hand)");
+            combo->Append(text, bmp ? *bmp : wxNullBitmap);
+        }
+
+        int pick = auto_pick(row, taken);
+        if (pick < 0)
+            pick = row < (int) m_offered.size() ? row : 0;
+        taken.push_back(pick);
+        combo->SetSelection(pick);
+        combo->Bind(wxEVT_COMBOBOX, [this](wxCommandEvent& e) {
+            refresh_warnings();
+            e.Skip();
+        });
+        row_sizer->Add(combo, 1, wxALIGN_CENTER_VERTICAL);
+
+        group_sizer->Add(row_sizer, 0, wxEXPAND);
+        group_sizer->AddSpacer(4);
+        m_slot_combos.push_back(combo);
+    }
+
+    m_warning_text = new wxStaticText(this, wxID_ANY, wxEmptyString);
+    m_warning_text->SetFont(::Label::Body_12);
+    m_warning_text->SetForegroundColour(wxColour("#D96C00"));
+    group_sizer->Add(m_warning_text, 0, wxTOP | wxEXPAND, FromDIP(4));
+
+    // Tell the user what the printer is going to do with a bare T0 today, because
+    // a stale non-identity map from a previous job is otherwise invisible.
+    if (!table.gcode_map.empty() && !table.map_is_identity()) {
+        auto it = table.gcode_map.find("T1A");
+        if (it != table.gcode_map.end() && it->second != "T1A") {
+            auto* stale = new wxStaticText(this, wxID_ANY,
+                wxString::Format(_L("Note: the printer currently resolves T1A to %s from an earlier job. "
+                                    "The mapping above replaces that."),
+                                 wxString::FromUTF8(it->second.c_str())));
+            stale->SetFont(::Label::Body_12);
+            stale->Wrap(FromDIP(420));
+            group_sizer->Add(stale, 0, wxTOP | wxEXPAND, FromDIP(4));
+        }
+    }
+
+    refresh_warnings();
+    this->Layout();
+    this->Fit();
+}
+
+std::map<std::string, std::string> CfsPrintHostSendDialog::extendedInfo() const
+{
+    std::map<std::string, std::string> info;
+    info[CrealityCFS::EXTENDED_SELFTEST] = m_self_test ? "1" : "0";
+
+    json list = json::array();
+    for (int i = 0; i < (int) m_slot_combos.size(); i++) {
+        const int sel = m_slot_combos[i]->GetSelection();
+        if (sel < 0 || sel >= (int) m_offered.size())
+            continue;
+        const CfsSlot& slot = m_offered[sel];
+        // id is the slot label the G-code will ask for, derived from the Orca tool
+        // number with the printer's own arithmetic (T0 -> T1A, T4 -> T2A, T5 -> T2B).
+        // boxId and materialId are the physical slot that serves it.
+        list.push_back({{"id", CrealityCFS::index_to_tnn(m_tool_index[i])},
+                        {"type", slot.type},
+                        {"color", slot.colour.empty() ? std::string("#000000") : slot.colour},
+                        {"boxId", slot.unit},
+                        {"materialId", slot.slot}});
+    }
+    if (!list.empty())
+        info[CrealityCFS::EXTENDED_COLORMATCH] = list.dump();
 
     return info;
 }
