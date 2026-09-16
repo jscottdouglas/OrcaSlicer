@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """Privacy scan: refuse to publish anything that points back at one machine.
 
-    python3 privacy_scan.py --root <dir|file> [--identifiers <file>] [--git] [--git-since <sha>]
+    python3 privacy_scan.py --root <dir|file> [--identifiers <file>] [--git]
+                            [--git-since <sha>] [--no-allow]
 
 Exit 0 when clean, 1 when a match is found, 2 when the scan could not run.
+
+A line containing the marker `privacy-scan: allow` is skipped, for the cases
+where a pattern is structurally right and the line is genuinely innocent: a
+protocol field whose name happens to end in Token, a JavaScript property whose
+name happens to be spelled like a key file's extension. Skipping
+is never silent: every skipped line is printed as `path:line: allowed: <text>`,
+so a marker cannot hide in a repository unnoticed and a reviewer sees exactly
+what was waved through. `--no-allow` ignores the markers and scans those lines
+like any other, which is how you check what the markers are actually covering.
 
 With --git, the commit authors, the commit messages and the lines each commit
 ADDS are all scanned, so data that was committed and later deleted is still
@@ -27,19 +37,39 @@ regex per line, which is never committed.
 """
 import argparse, os, re, subprocess, sys
 
-ALLOWED = ("192.168.1.50", "jscottdouglas@users.noreply.github.com")
+# `~/.cfsbridge` is the documented config and log location off Windows, so it
+# belongs in published docs and is not a leak of anybody's home directory.
+# The two addresses are the documented examples and nobody's real machine:
+# `.50` is always the printer, `.60` is always a bridge running on another PC.
+ALLOWED = ("192.168.1.50", "192.168.1.60",
+           "jscottdouglas@users.noreply.github.com", "~/.cfsbridge")
+# An inline, per-line waiver. Every use is printed, so it cannot hide.
+ALLOW_MARKER = "privacy-scan: allow"
 PATTERNS = [
     r"\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
     r"\b172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b",
     r"\b192\.168\.\d{1,3}\.\d{1,3}\b",
     r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
     r"C:\\Users\\", r"/home/[a-z]", r"/mnt/[a-z]/",
+    # A home-relative path is somebody's own machine layout, and it survives
+    # every scrub that only looks for absolute paths: a tilde-prefixed source
+    # or virtualenv directory says as much about one PC as the absolute form
+    # does. The first two patterns are the directories this project actually
+    # leaked; the third is the general case. ALLOWED carries the one
+    # home-relative path a reader is meant to see.
+    r"~/src", r"~/\.venvs", r"~/[A-Za-z]",  # privacy-scan: allow (a pattern matching itself)
+    r"\b(?:[0-9A-F]{2}:){7,}[0-9A-F]{2}\b",  # certificate fingerprints, long MAC-shaped ids
     # Credentials are matched by value, not by word: a bare "token" or
     # "apikey" is ordinary code (it.key(), "printhost_apikey"), while a
     # keyword assigned a quoted literal of six or more characters is a secret.
     # The optional quote before the separator catches the JSON and YAML form,
     # where the keyword itself is quoted too, as config files write it.
-    r"(?:password|passwd|api[_-]?key|token|secret)[\"']?\s*[:=]\s*[\"'][^\"']{6,}[\"']",
+    # The lookbehind requires the keyword to start a word, so a protocol field
+    # named getToken or a variable named user_secret_id is not a credential,
+    # while the same keyword standing on its own with a value still is.
+    # (Both cases are spelled out as literals in this scanner's own tests, not
+    # here, or these comments would themselves be hits.)
+    r"(?<![A-Za-z0-9_])(?:password|passwd|api[_-]?key|token|secret)[\"']?\s*[:=]\s*[\"'][^\"']{6,}[\"']",
     r"\bBearer\s+[A-Za-z0-9._-]{16,}",
     # Key and certificate file names, not the word "key": the lookahead keeps
     # it.key() and key_value out.
@@ -75,9 +105,18 @@ def _regex(extra):
     return [re.compile(p, re.I) for p in PATTERNS + list(extra)]
 
 
-def _hits_in_text(text, regs):
-    out = []
+def _hits_in_text(text, regs, allow_marker=True):
+    """Return (hits, allowed), each a list of (line number, text).
+
+    `allowed` is every line carrying ALLOW_MARKER, whether or not a pattern
+    would have fired on it: a marker on a line that needs no waiver is itself
+    worth seeing, and the caller prints the list either way.
+    """
+    out, allowed = [], []
     for n, line in enumerate(text.splitlines(), 1):
+        if allow_marker and ALLOW_MARKER in line:
+            allowed.append((n, line.strip()))
+            continue
         probe = line
         for a in ALLOWED:
             probe = probe.replace(a, "")
@@ -86,12 +125,13 @@ def _hits_in_text(text, regs):
             if m:
                 out.append((n, m.group(0)))
                 break
-    return out
+    return out, allowed
 
 
-def _scan_file(path, regs, hits):
+def _scan_file(path, regs, hits, allowed=None, allow_marker=True):
     name = os.path.basename(path)
-    for _, m in _hits_in_text(name, regs):
+    # A file name cannot carry a comment, so markers never apply to it.
+    for _, m in _hits_in_text(name, regs, allow_marker=False)[0]:
         hits.append((path, 0, "filename: " + m))
     if os.path.splitext(name)[1].lower() in SKIP_EXT:
         return
@@ -101,16 +141,24 @@ def _scan_file(path, regs, hits):
     except OSError as e:
         # A file the gate cannot read is not a clean file.
         raise ScanError("cannot read %s: %s" % (path, e))
-    for n, m in _hits_in_text(text, regs):
+    found, waived = _hits_in_text(text, regs, allow_marker)
+    for n, m in found:
         hits.append((path, n, m))
+    if allowed is not None:
+        for n, line in waived:
+            allowed.append((path, n, line))
 
 
-def scan_tree(root, extra_patterns=()):
-    """Scan a directory tree, or a single file when root names one."""
+def scan_tree(root, extra_patterns=(), allowed_out=None, allow_marker=True):
+    """Scan a directory tree, or a single file when root names one.
+
+    Returns the hits. Lines waived by ALLOW_MARKER are appended to
+    `allowed_out` when one is given, so the caller can print them.
+    """
     regs = _regex(extra_patterns)
     hits = []
     if os.path.isfile(root):
-        _scan_file(root, regs, hits)
+        _scan_file(root, regs, hits, allowed_out, allow_marker)
         return hits
 
     def _unlistable(e):
@@ -121,7 +169,7 @@ def scan_tree(root, extra_patterns=()):
     for d, dirs, files in os.walk(root, onerror=_unlistable):
         dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
         for f in files:
-            _scan_file(os.path.join(d, f), regs, hits)
+            _scan_file(os.path.join(d, f), regs, hits, allowed_out, allow_marker)
     return hits
 
 
@@ -141,7 +189,7 @@ def _git_log(root, args, since):
     return r.stdout
 
 
-def scan_git_messages(root, extra_patterns=(), since=None):
+def scan_git_messages(root, extra_patterns=(), since=None, allowed_out=None, allow_marker=True):
     """Scan commit authors and messages; since limits the range to <since>..HEAD."""
     regs = _regex(extra_patterns)
     log = _git_log(root, ["--format=%H%x00%an <%ae>%x00%B%x1e"], since)
@@ -150,12 +198,16 @@ def scan_git_messages(root, extra_patterns=(), since=None):
         if not rec.strip():
             continue
         sha, author, body = (rec.strip("\n").split("\x00") + ["", ""])[:3]
-        for n, m in _hits_in_text(author + "\n" + body, regs):
+        found, waived = _hits_in_text(author + "\n" + body, regs, allow_marker)
+        for n, m in found:
             hits.append(("commit " + sha[:10], n, m))
+        if allowed_out is not None:
+            for n, line in waived:
+                allowed_out.append(("commit " + sha[:10], n, line))
     return hits
 
 
-def scan_git_content(root, extra_patterns=(), since=None):
+def scan_git_content(root, extra_patterns=(), since=None, allowed_out=None, allow_marker=True):
     """Scan the lines each commit ADDS.
 
     The working tree can be spotless while the history still hands a reader the
@@ -172,8 +224,12 @@ def scan_git_content(root, extra_patterns=(), since=None):
         lines = rec.split("\n")
         sha = lines[0].strip()
         added = [l[1:] for l in lines[1:] if l.startswith("+") and not l.startswith("+++")]
-        for _, m in _hits_in_text("\n".join(added), regs):
+        found, waived = _hits_in_text("\n".join(added), regs, allow_marker)
+        for _, m in found:
             hits.append(("commit %s (content)" % sha[:10], 0, m))
+        if allowed_out is not None:
+            for _, line in waived:
+                allowed_out.append(("commit %s (content)" % sha[:10], 0, line))
     return hits
 
 
@@ -184,22 +240,31 @@ def main(argv=None):
     ap.add_argument("--git", action="store_true", help="also scan commit authors and messages")
     ap.add_argument("--git-since", metavar="SHA",
                     help="with --git, scan only <SHA>..HEAD instead of the whole history")
+    ap.add_argument("--no-allow", action="store_true",
+                    help="ignore `%s` markers and scan those lines too" % ALLOW_MARKER)
     a = ap.parse_args(argv)
     if not os.path.exists(a.root):
         # Otherwise a typo in --root would scan nothing and report "clean".
         ap.error("--root does not exist: %s" % a.root)
+    allow_marker = not a.no_allow
+    allowed = []
     try:
         extra = load_identifiers(a.identifiers) if a.identifiers else []
-        hits = scan_tree(a.root, extra)
+        hits = scan_tree(a.root, extra, allowed, allow_marker)
         if a.git:
-            hits += scan_git_messages(a.root, extra, a.git_since)
-            hits += scan_git_content(a.root, extra, a.git_since)
+            hits += scan_git_messages(a.root, extra, a.git_since, allowed, allow_marker)
+            hits += scan_git_content(a.root, extra, a.git_since, allowed, allow_marker)
     except ScanError as e:
         print("privacy_scan: %s" % e, file=sys.stderr)
         print("scan incomplete, refusing to report clean", file=sys.stderr)
         return 2
+    # Every waiver is printed, so a marker can never pass unseen.
+    for p, n, line in allowed:
+        print("%s:%d: allowed: %s" % (p, n, line))
     for p, n, m in hits:
         print("%s:%d: %s" % (p, n, m))
+    if allowed:
+        print("%d allowed line(s)" % len(allowed), file=sys.stderr)
     print("%d hit(s)" % len(hits), file=sys.stderr)
     return 1 if hits else 0
 
