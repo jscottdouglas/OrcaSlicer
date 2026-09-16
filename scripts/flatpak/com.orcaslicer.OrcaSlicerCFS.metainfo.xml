@@ -2,8 +2,8 @@
 <component type="desktop">
     <id>com.orcaslicer.OrcaSlicerCFS</id>
     <launchable type="desktop-id">com.orcaslicer.OrcaSlicerCFS.desktop</launchable>
-    <name>Unofficial Creality OrcaSlicer with CFS, Camera Support</name>
-    <summary>Get even more perfect prints!</summary>
+    <name>Unofficial Creality OrcaSlicer</name>
+    <summary>OrcaSlicer with Creality CFS and camera support for the K2 family</summary>
     <developer id="io.github.jscottdouglas">
         <name>jscottdouglas/OrcaSlicer</name>
     </developer>
