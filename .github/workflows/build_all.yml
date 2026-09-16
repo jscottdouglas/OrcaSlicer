@@ -5,6 +5,11 @@ on:
     branches:
      - main
      - release/*
+     # This fork's branch.
+     - cfs
+    # Release tags (v<upstream>-cfs.<n>) build the fork's published assets.
+    tags:
+     - 'v*'
     paths:
      - 'deps/**'
      - 'deps_src/**'
