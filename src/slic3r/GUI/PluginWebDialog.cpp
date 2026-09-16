@@ -55,6 +55,16 @@ wxString web_base_url()
     return wxString("file://") + from_u8(dir) + "/";
 }
 
+
+// True when two consecutive main-frame URLs name the same document, i.e. they differ
+// only in the fragment. The MSW backend synthesises a wxEVT_WEBVIEW_LOADED for such
+// in-document navigation (a page setting location.hash), which must not be mistaken
+// for a reload; an identical URL is a genuine reload and is not fragment navigation.
+bool is_fragment_navigation(const wxString& from, const wxString& to)
+{
+    return from != to && from.BeforeFirst('#') == to.BeforeFirst('#');
+}
+
 } // namespace
 
 PluginWebDialog::PluginWebDialog(wxWindow*          parent,
@@ -139,19 +149,32 @@ void PluginWebDialog::destroy_for_plugin(PluginWebDialog* dialog)
 
 void PluginWebDialog::on_bootstrap_event(wxWebViewEvent& event)
 {
-    // The first bootstrap load (or its error) triggers the swap to plugin HTML;
-    // the resulting plugin-page load is ignored (guarded by m_content_loaded).
-    load_plugin_content();
+    // The first bootstrap load (or its error) triggers the swap to plugin HTML. Once that
+    // page has settled, a further main-frame load is a browser reload (context menu or
+    // keyboard shortcut): the injected page has no URL of its own, so the reload fetches
+    // the base URL instead and the plugin HTML has to be put back. In-document navigation
+    // is not a reload and must be left alone, as is a post-load error, which only ever
+    // means a failed subresource.
+    if (!m_content_loaded)
+        load_plugin_content();
+    else if (event.GetEventType() == wxEVT_WEBVIEW_LOADED) {
+        const wxString previous_url = m_last_url;
+        m_last_url                  = event.GetURL();
+        if (m_own_page_load)
+            m_own_page_load = false;
+        else if (!is_fragment_navigation(previous_url, m_last_url))
+            load_plugin_content();
+    }
     event.Skip();
 }
 
 void PluginWebDialog::load_plugin_content()
 {
-    if (m_content_loaded)
-        return;
     m_content_loaded = true;
-    if (wxWebView* wv = browser())
+    if (wxWebView* wv = browser()) {
+        m_own_page_load = true;
         wv->SetPage(wxString::FromUTF8(m_html), web_base_url());
+    }
 }
 
 void PluginWebDialog::on_script_message(const nlohmann::json& payload)
