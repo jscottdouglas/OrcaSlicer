@@ -20,6 +20,10 @@
 //     the boxsInfo reply while a job is holding one
 //   * the slot table merges boxsInfo with Moonraker's box object so remaining
 //     length is known and a manual touchscreen slot edit is visible
+//   * every mapped slot's minTemp is raised to the job's own nozzle temperature
+//     with modifyMaterial before the colorMatch write, because the printer takes
+//     its pre-print calibration, load, unload and purge temperatures from the
+//     slot's material entry and not from the G-code
 //   * the G-code tool label arithmetic is the printer's own: tool 0 is T1A,
 //     tool 4 is T2A, tool 5 is T2B
 
@@ -45,6 +49,7 @@ struct CfsSlot
     int         slot    = 0;      // 0..3 = A..D
     std::string type;             // "PLA", "PETG", ... empty when the slot is empty
     std::string colour;           // "#RRGGBB", empty when unknown
+    std::string colour_raw;       // exactly what the printer reported, "#0RRGGBB"
     std::string vendor;
     std::string name;
     std::string rfid;             // Creality material id, e.g. "P1003"
@@ -54,6 +59,16 @@ struct CfsSlot
     bool        loaded     = false; // currently fed to the toolhead
     bool        mapped     = false; // a G-code slot label resolves here right now
     bool        edited     = false; // type came from a manual edit, not an RFID tag
+
+    // The rest of the printer's own material entry, carried over unchanged by a
+    // modifyMaterial write. The printer heats to minTemp for everything it does
+    // outside the job itself, so this is what the send-time sync raises.
+    int         box_type   = -1;   // materialBoxs[].type, negative on every variant
+                                   // but the CFS Mini, the only one whose slot
+                                   // edit carries it
+    double      min_temp   = -1.0; // C, negative when the printer did not say
+    double      max_temp   = -1.0; // C, negative when the printer did not say
+    double      pressure   = 0.0;
 
     bool        is_external() const { return unit == 0; }
     std::string label() const;      // "2B", or "Ext" for the spool holder
@@ -115,6 +130,17 @@ public:
     // 0 -> "T1A", 3 -> "T1D", 4 -> "T2A", 5 -> "T2B", 15 -> "T4D".
     static std::string index_to_tnn(int index);
 
+    // The inverse: "T1A" -> 0, "T2B" -> 5. Returns -1 for anything that is not
+    // one of those labels.
+    static int tnn_to_index(const std::string& tnn);
+
+    // The per-extruder nozzle temperatures out of the config block Orca writes
+    // at the end of the G-code, from "; nozzle_temperature = 230,215". Index i
+    // is Orca extruder i and 0 means the file did not name one;
+    // "; nozzle_temperature_initial_layer" fills in whatever the first key left
+    // out. An empty result means neither key was present.
+    static std::vector<int> parse_nozzle_temperatures(const std::string& gcode_tail);
+
     // Creality reports "#0RRGGBB" (seven hex digits). Return "#RRGGBB", or an
     // empty string when the value means "no colour".
     static std::string normalise_colour(const std::string& value);
@@ -128,6 +154,10 @@ public:
     // a JSON array of {"id","type","color","boxId","materialId"} objects.
     static constexpr const char* EXTENDED_COLORMATCH = "cfs_colormatch";
     static constexpr const char* EXTENDED_SELFTEST   = "cfs_selftest";
+
+    // "1" or "0": whether the send writes the job's nozzle temperature into the
+    // mapped slots. Absent means yes, which is the dialog's default.
+    static constexpr const char* EXTENDED_SYNC_SLOT_TEMP = "cfs_sync_slot_temp";
 
     // "F008" -> "K2 Plus". Empty id gives an empty string.
     static std::string model_name_for(const std::string& model_id);
@@ -150,6 +180,53 @@ private:
     // when the map could not be read at all, which is a different problem and
     // gets a different message.
     bool verify_color_match(const std::string& colormatch_json, std::string& missing, std::string& read_error) const;
+
+    // boxsInfo on its own, without the Moonraker merge query_slot_table does.
+    // This is what the slot temperature write reads to carry the existing entry
+    // over, and what it polls to read the write back.
+    bool read_slot_materials(std::vector<CfsSlot>& slots, std::string& error) const;
+
+    // "standby", "printing", "paused", "complete", ... Moonraker's
+    // print_stats.state when it answers, otherwise derived from the LAN
+    // socket's own deviceState flag, and "unknown" when neither said anything.
+    std::string print_state() const;
+
+    // What sync_slot_temperatures managed to do. The caller composes the message
+    // from this rather than being handed one, because whether a slot that never
+    // read back is fatal depends on whether a print is about to start.
+    struct SlotTempOutcome
+    {
+        std::string unverified; // the slots that never read back, with their values
+        std::string changed;    // the slots this call did change, comma separated
+        std::string transport;  // set instead when a write could not be sent at all
+    };
+
+    // Raise every mapped slot's minTemp to the job's nozzle temperature for that
+    // extruder. `job_temps` is parse_nozzle_temperatures' result. A slot already
+    // at or above the job temperature, one the G-code names no temperature for,
+    // and the external spool holder are all left alone.
+    //
+    // Every slot that needs raising is written in one round, then a single
+    // boxsInfo read per poll checks all of them at once and the ones that agree
+    // drop out; the remainder get another round, up to the colorMatch write's
+    // budget. So the cost is bounded by the budget and not by the slot count.
+    // False means at least one slot never read back; `outcome` says which.
+    bool sync_slot_temperatures(const std::string&      colormatch_json,
+                                const std::vector<int>& job_temps,
+                                const InfoFn&           info_fn,
+                                SlotTempOutcome&        outcome) const;
+
+    // Report a sync that did not fully land, and say whether the send may carry
+    // on. For Upload and Print it must not: the job would start with a slot the
+    // printer will heat to the wrong temperature, so this raises the error and
+    // returns false. For a plain Upload it may: the file is on the printer, no
+    // job is being started, and nothing is about to print, so this reports a
+    // warning and returns true. Either way the message names the slots that were
+    // already changed, because the printer has been left part way.
+    bool handle_slot_temp_failure(const SlotTempOutcome& outcome,
+                                  bool                   will_start_print,
+                                  const ErrorFn&         error_fn,
+                                  const InfoFn&          info_fn) const;
 
     mutable wxString m_test_summary;
 };
