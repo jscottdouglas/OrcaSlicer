@@ -245,13 +245,18 @@ public:
     virtual std::map<std::string, std::string> extendedInfo() const override;
 
 private:
-    static constexpr const char* CONFIG_KEY_CFS_SELFTEST = "crealitycfs_enable_self_test";
+    static constexpr const char* CONFIG_KEY_CFS_SELFTEST       = "crealitycfs_enable_self_test";
+    static constexpr const char* CONFIG_KEY_CFS_SYNC_SLOT_TEMP = "cfs_sync_slot_temp";
 
     void refresh_warnings();
     int  auto_pick(int tool_index, const std::vector<int>& already_taken) const;
 
     PrintHost*    m_printhost;
     bool          m_self_test = false;
+    // On by default: the printer's own temperatures for everything outside the
+    // job come from the slot, so a slot left on a Generic entry's 190 C floor
+    // calibrates a hotter filament far too cold.
+    bool          m_sync_slot_temp = true;
     wxStaticText* m_warning_text = nullptr;
 
     // Index i of each vector belongs to the i-th row, that is to G-code tool

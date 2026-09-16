@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/trim.hpp>
 #include <boost/format.hpp>
 #include <boost/log/trivial.hpp>
 
@@ -35,6 +36,10 @@ namespace websocket = beast::websocket;
 namespace net       = boost::asio;
 using tcp           = boost::asio::ip::tcp;
 using json          = nlohmann::json;
+// nlohmann::json sorts an object's keys. Most frames here do not care, but the
+// modifyMaterial one is written out in the client's own field order, so it is
+// built with the insertion-ordered flavour instead.
+using ojson         = nlohmann::ordered_json;
 
 namespace Slic3r {
 
@@ -47,6 +52,11 @@ static const int   CFS_FLUIDD_PORT   = 4408;
 static const int   SLOTS_PER_UNIT = 4;
 static const int   MAX_UNITS      = 4;
 
+// materialBoxs[].materialBoxName, the CFS variant's hardware id. The Mini is
+// the only variant whose slot edit carries a boxType field; every other one,
+// the plain CFS included, sends the form without it.
+static const char* CFS_MINI_MODEL = "MF046";
+
 // How hard to try to get the colorMatch table installed. The write lands in the
 // printer's map table in well under a second when it is going to land at all
 // (measured against 192.168.1.50: box.map changed 0.4 s after the write), so
@@ -55,6 +65,20 @@ static const int   MAX_UNITS      = 4;
 static const int COLORMATCH_WRITE_ATTEMPTS = 3;
 static const int COLORMATCH_READBACK_POLLS = 6;
 static const int COLORMATCH_POLL_MS        = 400;
+
+// The slot temperature write is the same shape of problem as the colorMatch
+// write, so it gets the same budget rather than one of its own.
+static const int SLOTTEMP_WRITE_ATTEMPTS = COLORMATCH_WRITE_ATTEMPTS;
+static const int SLOTTEMP_READBACK_POLLS = COLORMATCH_READBACK_POLLS;
+static const int SLOTTEMP_POLL_MS        = COLORMATCH_POLL_MS;
+
+// A read-back temperature this close to the one asked for counts as a match.
+// The printer stores and reports floats, so an exact comparison is no use.
+static const double SLOTTEMP_EPSILON = 0.5;
+
+// How much of the end of the G-code to read looking for the config block. Orca
+// writes it last and it is tens of kilobytes even for a many-filament project.
+static const std::streamoff CFS_GCODE_TAIL_BYTES = 256 * 1024;
 
 // -- CfsSlot / CfsSlotTable ----------------------------------------------
 
@@ -129,6 +153,10 @@ public:
 
     void send(const json& cmd) { m_ws.write(net::buffer(cmd.dump())); }
 
+    // For a frame whose field order matters and which is therefore serialised
+    // by the caller.
+    void send_raw(const std::string& text) { m_ws.write(net::buffer(text)); }
+
     // Read frames until one carries `key`, merging every frame into m_state so
     // the opening full state dump is not thrown away.
     bool read_until(const std::string& key, json& out, int max_reads = 40)
@@ -187,16 +215,16 @@ std::string json_str(const json& obj, const char* key, const std::string& fallba
     return fallback;
 }
 
-// Fetch Moonraker's `box` object, unwrapped down to the object itself.
-// This is the only place the live G-code-slot map can be read from on an idle
-// printer: see also the note in CrealityCFS::verify_color_match.
-bool fetch_box_object(const std::string& host, json& box, std::string& error)
+// Fetch one Moonraker printer object, unwrapped down to the object itself
+// through the result / status / <name> envelope Moonraker wraps it in.
+bool fetch_moonraker_object(const std::string& host, const char* name, json& out, std::string& error)
 {
     std::string body;
     bool        got = false;
     std::string transport_error;
 
-    auto http = Http::get("http://" + host + ":" + std::to_string(CFS_MOONRAKER_PORT) + "/printer/objects/query?box");
+    auto http = Http::get("http://" + host + ":" + std::to_string(CFS_MOONRAKER_PORT) +
+                          "/printer/objects/query?" + name);
     http.timeout_max(5)
         .on_complete([&](std::string b, unsigned) {
             body = std::move(b);
@@ -212,23 +240,30 @@ bool fetch_box_object(const std::string& host, json& box, std::string& error)
         return false;
     }
     try {
-        json parsed = json::parse(body);
-        box         = parsed;
-        if (box.is_object() && box.contains("result"))
-            box = box["result"];
-        if (box.is_object() && box.contains("status"))
-            box = box["status"];
-        if (box.is_object() && box.contains("box"))
-            box = box["box"];
+        out = json::parse(body);
+        if (out.is_object() && out.contains("result"))
+            out = out["result"];
+        if (out.is_object() && out.contains("status"))
+            out = out["status"];
+        if (out.is_object() && out.contains(name))
+            out = out[name];
     } catch (const std::exception& e) {
-        error = std::string("the Moonraker box object could not be parsed: ") + e.what();
+        error = std::string("the Moonraker ") + name + " object could not be parsed: " + e.what();
         return false;
     }
-    if (!box.is_object()) {
-        error = "the printer has no Moonraker box object";
+    if (!out.is_object()) {
+        error = std::string("the printer has no Moonraker ") + name + " object";
         return false;
     }
     return true;
+}
+
+// Moonraker's `box` object. This is the only place the live G-code-slot map can
+// be read from on an idle printer: see also the note in
+// CrealityCFS::verify_color_match.
+bool fetch_box_object(const std::string& host, json& box, std::string& error)
+{
+    return fetch_moonraker_object(host, "box", box, error);
 }
 
 int json_int(const json& obj, const char* key, int fallback = 0)
@@ -248,6 +283,178 @@ int json_int(const json& obj, const char* key, int fallback = 0)
     return fallback;
 }
 
+double json_double(const json& obj, const char* key, double fallback = 0.0)
+{
+    if (!obj.is_object() || !obj.contains(key))
+        return fallback;
+    const json& v = obj[key];
+    if (v.is_number())
+        return v.get<double>();
+    if (v.is_string()) {
+        try {
+            return std::stod(v.get<std::string>());
+        } catch (...) {
+            return fallback;
+        }
+    }
+    return fallback;
+}
+
+// boxsInfo.materialBoxs flattened into one slot per physical slot. When
+// `units_present` is given it collects the CFS unit ids the printer says are
+// actually on the bus.
+void parse_material_boxes(const json& boxs_info, std::vector<CfsSlot>& slots, std::set<int>* units_present)
+{
+    if (!boxs_info.is_object() || !boxs_info.contains("materialBoxs") || !boxs_info["materialBoxs"].is_array())
+        return;
+
+    for (const auto& box : boxs_info["materialBoxs"]) {
+        const int box_id = json_int(box, "id", -1);
+        if (box_id < 0 || box_id > MAX_UNITS)
+            continue;
+        // id 0 is the external spool holder. It is kept in the table because the
+        // user may legitimately print from it, but it is not a CFS unit.
+        if (units_present != nullptr && box_id >= 1 && json_int(box, "state", 0) == 1)
+            units_present->insert(box_id);
+
+        // Every unit reports a "type", so the presence of that key decides
+        // nothing: it is the hardware id that says whether a modifyMaterial
+        // write carries boxType. Anything but a Mini leaves this negative and
+        // the key is left out of the frame entirely.
+        std::string box_model = json_str(box, "materialBoxName");
+        boost::trim(box_model);
+        const int box_type = box_model == CFS_MINI_MODEL ? json_int(box, "type", 0) : -1;
+
+        if (!box.contains("materials") || !box["materials"].is_array())
+            continue;
+        for (const auto& mat : box["materials"]) {
+            const int mid = json_int(mat, "id", -1);
+            if (mid < 0 || mid >= SLOTS_PER_UNIT)
+                continue;
+            CfsSlot s;
+            s.unit       = box_id;
+            s.slot       = mid;
+            s.type       = json_str(mat, "type");
+            s.colour_raw = json_str(mat, "color");
+            s.colour     = CrealityCFS::normalise_colour(s.colour_raw);
+            s.vendor     = json_str(mat, "vendor");
+            s.name       = json_str(mat, "name");
+            s.rfid       = json_str(mat, "rfid");
+            s.percent    = json_int(mat, "percent", 0);
+            s.loaded     = json_int(mat, "selected", 0) != 0;
+            s.present    = json_int(mat, "state", 0) != 0;
+            s.box_type   = box_type;
+            s.min_temp   = json_double(mat, "minTemp", -1.0);
+            s.max_temp   = json_double(mat, "maxTemp", -1.0);
+            s.pressure   = json_double(mat, "pressure", 0.0);
+            slots.push_back(std::move(s));
+        }
+    }
+}
+
+CfsSlot* find_slot(std::vector<CfsSlot>& slots, int unit, int slot)
+{
+    for (auto& s : slots)
+        if (s.unit == unit && s.slot == slot)
+            return &s;
+    return nullptr;
+}
+
+// One physical slot waiting for its temperature write to read back.
+struct PendingSlotTemp
+{
+    int         box = 0;
+    int         mat = 0;
+    std::string label;      // "1C"
+    double      want_min = 0.0;
+    double      want_max = 0.0;
+    std::string frame;      // the modifyMaterial message, built once
+    double      read_min = -1.0; // what the last read-back saw
+    double      read_max = -1.0;
+};
+
+std::string join_labels(const std::vector<std::string>& labels)
+{
+    std::string out;
+    for (const auto& label : labels) {
+        if (!out.empty())
+            out += ", ";
+        out += label;
+    }
+    return out;
+}
+
+// A temperature for a message or a log line. The printer stores floats but they
+// are whole degrees in practice, and "230" reads better than "230.000000".
+std::string temp_text(double value) { return std::to_string(std::llround(value)); }
+
+// Only plain-text G-code carries the config block the job temperature is read
+// from. A .3mf or a binary .bgcode has no "; nozzle_temperature" line, and a
+// byte run inside one could be mistaken for one, so the extension decides
+// rather than whatever the parse happens to find.
+bool is_plain_text_gcode(const boost::filesystem::path& path)
+{
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return char(std::tolower(c)); });
+    return ext == ".gcode" || ext == ".gco" || ext == ".g";
+}
+
+// The last `bytes` bytes of a file, which is where Orca puts the config block.
+// A tail that did not start at the beginning of the file starts in the middle of
+// a line, and that half line is dropped rather than parsed as a whole one.
+std::string read_file_tail(const boost::filesystem::path& path, std::streamoff bytes)
+{
+    try {
+        boost::nowide::ifstream in(path.string().c_str(), std::ios::binary);
+        if (!in.good())
+            return {};
+        in.seekg(0, std::ios::end);
+        const std::streamoff size = in.tellg();
+        const bool           whole = size <= bytes;
+        in.seekg(whole ? 0 : size - bytes, std::ios::beg);
+        std::ostringstream out;
+        out << in.rdbuf();
+        std::string tail = out.str();
+        if (!whole) {
+            const auto first_line_end = tail.find('\n');
+            tail = first_line_end == std::string::npos ? std::string() : tail.substr(first_line_end + 1);
+        }
+        return tail;
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
+// {"method":"set","params":{"modifyMaterial":{...}}}, the slot edit. This is
+// CrealityPrint's own DeviceInterface.SetMaterials frame: the fields go out in
+// the order boxId, boxType (only where the unit reports one), id, rfid, type,
+// vendor, name, color, minTemp, maxTemp, pressure, every one of them carried
+// over from the entry the printer already holds except the two temperatures.
+// The client forces the temperatures to be floats by adding 1e-8 to each, and
+// so does this, so that what lands on the wire is what the printer is used to.
+std::string modify_material_message(const CfsSlot& slot, double min_temp, double max_temp)
+{
+    ojson inner = ojson::object();
+    inner["boxId"] = slot.unit;
+    if (slot.box_type >= 0)
+        inner["boxType"] = slot.box_type;
+    inner["id"]       = slot.slot;
+    inner["rfid"]     = slot.rfid;
+    inner["type"]     = slot.type;
+    inner["vendor"]   = slot.vendor;
+    inner["name"]     = slot.name;
+    inner["color"]    = slot.colour_raw;
+    inner["minTemp"]  = min_temp + 1e-8;
+    inner["maxTemp"]  = max_temp + 1e-8;
+    inner["pressure"] = slot.pressure;
+
+    ojson message      = ojson::object();
+    message["method"]  = "set";
+    message["params"]["modifyMaterial"] = inner;
+    return message.dump();
+}
+
 } // namespace
 
 // -- helpers -------------------------------------------------------------
@@ -261,6 +468,64 @@ std::string CrealityCFS::index_to_tnn(int index)
     const int unit = index / SLOTS_PER_UNIT + 1;
     const int slot = index % SLOTS_PER_UNIT;
     return "T" + std::to_string(unit) + std::string(1, char('A' + slot));
+}
+
+int CrealityCFS::tnn_to_index(const std::string& tnn)
+{
+    if (tnn.size() != 3 || std::toupper(static_cast<unsigned char>(tnn[0])) != 'T')
+        return -1;
+    const int unit = tnn[1] - '0';
+    const int slot = std::toupper(static_cast<unsigned char>(tnn[2])) - 'A';
+    if (unit < 1 || unit > MAX_UNITS || slot < 0 || slot >= SLOTS_PER_UNIT)
+        return -1;
+    return (unit - 1) * SLOTS_PER_UNIT + slot;
+}
+
+std::vector<int> CrealityCFS::parse_nozzle_temperatures(const std::string& gcode_tail)
+{
+    // The config block is a run of "; key = value" comments, and a per-extruder
+    // value is a comma separated list in extruder order. Both keys are read
+    // rather than the first one found, because a key can legitimately be absent
+    // and there is no ordering guarantee between them.
+    std::vector<int> working;
+    std::vector<int> initial;
+
+    std::istringstream lines(gcode_tail);
+    std::string        line;
+    while (std::getline(lines, line)) {
+        if (line.empty() || line[0] != ';')
+            continue;
+        const auto eq = line.find('=');
+        if (eq == std::string::npos)
+            continue;
+        std::string key = line.substr(1, eq - 1);
+        boost::trim(key);
+        // Exact keys only: nozzle_temperature_range_low and _range_high are
+        // the filament's limits, not the job's temperature.
+        std::vector<int>* into = key == "nozzle_temperature"               ? &working :
+                                 key == "nozzle_temperature_initial_layer" ? &initial :
+                                                                             nullptr;
+        if (into == nullptr)
+            continue;
+        into->clear();
+        std::istringstream values(line.substr(eq + 1));
+        std::string        value;
+        while (std::getline(values, value, ',')) {
+            boost::trim(value);
+            try {
+                into->push_back(std::stoi(value));
+            } catch (...) {
+                into->push_back(0);
+            }
+        }
+    }
+
+    std::vector<int> out = working;
+    out.resize(std::max(working.size(), initial.size()), 0);
+    for (size_t i = 0; i < out.size(); i++)
+        if (out[i] <= 0 && i < initial.size())
+            out[i] = initial[i];
+    return out;
 }
 
 std::string CrealityCFS::normalise_colour(const std::string& value)
@@ -739,38 +1004,7 @@ bool CrealityCFS::query_slot_table(CfsSlotTable& table, std::string& error) cons
     }
     table.model_name = model_name_for(table.model_id);
 
-    if (boxs_info.contains("materialBoxs") && boxs_info["materialBoxs"].is_array()) {
-        for (const auto& box : boxs_info["materialBoxs"]) {
-            const int box_id   = json_int(box, "id", -1);
-            const int box_type = json_int(box, "type", 0);
-            if (box_id < 0 || box_id > MAX_UNITS)
-                continue;
-            // id 0 is the external spool holder. It is kept in the table because the
-            // user may legitimately print from it, but it is not a CFS unit.
-            if (box_id >= 1 && json_int(box, "state", 0) == 1)
-                table.units_present.insert(box_id);
-            if (!box.contains("materials") || !box["materials"].is_array())
-                continue;
-            for (const auto& mat : box["materials"]) {
-                const int mid = json_int(mat, "id", -1);
-                if (mid < 0 || mid >= SLOTS_PER_UNIT)
-                    continue;
-                CfsSlot s;
-                s.unit    = box_id;
-                s.slot    = mid;
-                s.type    = json_str(mat, "type");
-                s.colour  = normalise_colour(json_str(mat, "color"));
-                s.vendor  = json_str(mat, "vendor");
-                s.name    = json_str(mat, "name");
-                s.rfid    = json_str(mat, "rfid");
-                s.percent = json_int(mat, "percent", 0);
-                s.loaded  = json_int(mat, "selected", 0) != 0;
-                s.present = json_int(mat, "state", 0) != 0;
-                (void) box_type;
-                table.slots.push_back(std::move(s));
-            }
-        }
-    }
+    parse_material_boxes(boxs_info, table.slots, &table.units_present);
 
     // colorMatch names the physical slots serving the current job.
     if (boxs_info.contains("colorMatch") && boxs_info["colorMatch"].is_array()) {
@@ -1002,6 +1236,283 @@ bool CrealityCFS::verify_color_match(const std::string& colormatch_json, std::st
     return missing.empty();
 }
 
+// -- slot temperature sync -----------------------------------------------
+//
+// The K2 does not take the temperature for anything outside the job proper from
+// the G-code: pre-print calibration, the load, the unload and the purge all heat
+// to the mapped slot's own minTemp. Creality's Generic entries start at 190 C
+// and the printer treats that as a working floor, so a Generic PLA slot printing
+// a 230 C filament calibrates around 50 C too cold and the calibration fails.
+// The job knows the right number, so the send writes it into the slot first.
+
+bool CrealityCFS::read_slot_materials(std::vector<CfsSlot>& slots, std::string& error) const
+{
+    slots.clear();
+    json boxs_info;
+    try {
+        LanSocket sock(m_cfs_host);
+        sock.send(json{{"method", "get"}, {"params", {{"boxsInfo", 1}}}});
+        if (!sock.read_until("boxsInfo", boxs_info)) {
+            error = "the printer did not answer a boxsInfo request on port 9999";
+            return false;
+        }
+    } catch (const std::exception& e) {
+        error = std::string("could not reach the printer on port 9999: ") + e.what();
+        return false;
+    }
+    parse_material_boxes(boxs_info, slots, nullptr);
+    if (slots.empty()) {
+        error = "the printer reported no CFS slots";
+        return false;
+    }
+    return true;
+}
+
+std::string CrealityCFS::print_state() const
+{
+    // Moonraker names "paused" separately, which the LAN protocol's deviceState
+    // does not, so it is the authority whenever it answers.
+    json        stats;
+    std::string error;
+    if (fetch_moonraker_object(m_cfs_host, "print_stats", stats, error)) {
+        std::string state = json_str(stats, "state");
+        std::transform(state.begin(), state.end(), state.begin(),
+                       [](unsigned char c) { return char(std::tolower(c)); });
+        boost::trim(state);
+        if (!state.empty())
+            return state;
+    }
+
+    // Without Moonraker, deviceState is the printer's own "idle and accepting
+    // jobs" flag: 0 means idle and anything else means a job has the machine.
+    try {
+        LanSocket sock(m_cfs_host);
+        sock.send(json{{"method", "get"}, {"params", {{"boxsInfo", 1}}}});
+        json ignored;
+        sock.read_until("boxsInfo", ignored);
+        if (sock.state().contains("deviceState"))
+            return json_int(sock.state(), "deviceState", -1) == 0 ? "standby" : "printing";
+    } catch (const std::exception&) {}
+    return "unknown";
+}
+
+bool CrealityCFS::sync_slot_temperatures(const std::string&      colormatch_json,
+                                         const std::vector<int>& job_temps,
+                                         const InfoFn&           info_fn,
+                                         SlotTempOutcome&        outcome) const
+{
+    outcome = SlotTempOutcome();
+
+    json wanted;
+    try {
+        wanted = json::parse(colormatch_json);
+    } catch (const std::exception&) {
+        return true; // start_job logs the bad payload; nothing to sync from
+    }
+    if (!wanted.is_array() || wanted.empty())
+        return true;
+
+    // Editing a slot the machine is feeding right now relabels the filament
+    // being extruded, so a job on the bed stops this dead. It is not an error:
+    // the send itself is what will fail next, with its own message.
+    const std::string state = print_state();
+    if (state == "printing" || state == "paused") {
+        BOOST_LOG_TRIVIAL(warning) << "CrealityCFS: the printer reports " << state
+                                   << ", so the mapped slots' temperature was left alone";
+        return true;
+    }
+
+    std::vector<CfsSlot> slots;
+    std::string          read_error;
+    if (!read_slot_materials(slots, read_error)) {
+        // With no current entry there is nothing to carry over, so the write
+        // cannot be made at all. Say so and let the send go on unchanged.
+        BOOST_LOG_TRIVIAL(warning) << "CrealityCFS: " << read_error
+                                   << ", so the mapped slots' temperature was left alone";
+        return true;
+    }
+
+    // One entry per physical slot that needs raising. Two mapped filaments may
+    // name the same slot, in which case the hotter of the two wins and only one
+    // write is queued for it.
+    std::vector<PendingSlotTemp> pending;
+    for (const auto& w : wanted) {
+        const std::string id  = json_str(w, "id");
+        const int         box = json_int(w, "boxId", -1);
+        const int         mat = json_int(w, "materialId", -1);
+        // The external spool holder has no material entry to edit.
+        if (box < 1 || box > MAX_UNITS || mat < 0 || mat >= SLOTS_PER_UNIT)
+            continue;
+
+        const std::string label = std::to_string(box) + std::string(1, char('A' + mat));
+
+        const CfsSlot* slot = find_slot(slots, box, mat);
+        if (slot == nullptr) {
+            BOOST_LOG_TRIVIAL(info) << "CrealityCFS: the printer reports no slot " << label
+                                    << ", so its temperature was left alone";
+            continue;
+        }
+
+        const int tool = tnn_to_index(id);
+        if (tool < 0 || tool >= (int) job_temps.size() || job_temps[tool] <= 0) {
+            BOOST_LOG_TRIVIAL(info) << "CrealityCFS: the G-code names no nozzle temperature for " << id
+                                    << ", so slot " << label << " was left alone";
+            continue;
+        }
+
+        if (slot->min_temp < 0.0 || slot->max_temp < 0.0) {
+            // Without the printer's own numbers there is nothing to carry over
+            // and no way to check a write landed, so the slot is left as it is.
+            BOOST_LOG_TRIVIAL(info) << "CrealityCFS: the printer reports no temperature for slot " << label
+                                    << ", so it was left alone";
+            continue;
+        }
+
+        const double want_min = double(job_temps[tool]);
+        if (slot->min_temp >= want_min - SLOTTEMP_EPSILON) {
+            BOOST_LOG_TRIVIAL(info) << "CrealityCFS: slot " << label << " is already at " << slot->min_temp
+                                    << " C, at or above the job's " << want_min << " C; left alone";
+            continue;
+        }
+
+        PendingSlotTemp* already = nullptr;
+        for (auto& p : pending)
+            if (p.box == box && p.mat == mat)
+                already = &p;
+        if (already != nullptr) {
+            if (want_min > already->want_min) {
+                already->want_min = want_min;
+                already->want_max = std::max(already->want_max, want_min);
+                already->frame    = modify_material_message(*slot, already->want_min, already->want_max);
+            }
+            continue;
+        }
+
+        PendingSlotTemp p;
+        p.box      = box;
+        p.mat      = mat;
+        p.label    = label;
+        p.want_min = want_min;
+        p.want_max = std::max(slot->max_temp, want_min);
+        p.frame    = modify_material_message(*slot, p.want_min, p.want_max);
+        p.read_min = slot->min_temp;
+        p.read_max = slot->max_temp;
+        pending.push_back(std::move(p));
+    }
+
+    if (pending.empty())
+        return true;
+
+    std::vector<std::string> changed;
+
+    for (int round = 1; round <= SLOTTEMP_WRITE_ATTEMPTS && !pending.empty(); ++round) {
+        // Every slot still pending is written back to back, with no polling in
+        // between: the polling is shared and happens once, below. Each frame
+        // still gets its own socket, the way every other `set` in this file
+        // does, because the firmware closes a connection whenever it feels like
+        // it and nothing proves it processes a second frame on one.
+        int index = 0;
+        for (const auto& p : pending) {
+            ++index;
+            BOOST_LOG_TRIVIAL(info) << "CrealityCFS: modifyMaterial round " << round << ": slot " << p.label << " to "
+                                    << temp_text(p.want_min) << "/" << temp_text(p.want_max) << " C";
+            if (info_fn)
+                info_fn(L"status", wxString::Format(_L("Setting CFS slot %s temperature (%d of %d)..."),
+                                                    wxString::FromUTF8(p.label.c_str()), index, int(pending.size())));
+            try {
+                LanSocket sock(m_cfs_host);
+                sock.send_raw(p.frame);
+            } catch (const std::exception& e) {
+                outcome.transport = "the write for slot " + p.label + " could not be sent to the printer: " + e.what();
+                outcome.changed   = join_labels(changed);
+                return false;
+            }
+        }
+
+        // One boxsInfo read per poll, checked against every slot still pending,
+        // so the polling cost does not multiply by the number of slots either.
+        for (int poll = 1; poll <= SLOTTEMP_READBACK_POLLS && !pending.empty(); ++poll) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(SLOTTEMP_POLL_MS));
+            std::vector<CfsSlot> again;
+            std::string          again_error;
+            if (!read_slot_materials(again, again_error)) {
+                BOOST_LOG_TRIVIAL(info) << "CrealityCFS: modifyMaterial round " << round << ", read-back " << poll
+                                        << ": could not read back, " << again_error;
+                continue;
+            }
+            for (auto it = pending.begin(); it != pending.end();) {
+                const CfsSlot* now = find_slot(again, it->box, it->mat);
+                if (now == nullptr) {
+                    ++it;
+                    continue;
+                }
+                it->read_min      = now->min_temp;
+                it->read_max      = now->max_temp;
+                const bool landed = it->read_min >= it->want_min - SLOTTEMP_EPSILON &&
+                                    it->read_max >= it->want_max - SLOTTEMP_EPSILON;
+                BOOST_LOG_TRIVIAL(info) << "CrealityCFS: modifyMaterial round " << round << ", read-back " << poll
+                                        << ": slot " << it->label << " asked for " << temp_text(it->want_min) << "/"
+                                        << temp_text(it->want_max) << " C, reads " << temp_text(it->read_min) << "/"
+                                        << temp_text(it->read_max) << " C: " << (landed ? "accepted" : "not yet");
+                if (!landed) {
+                    ++it;
+                    continue;
+                }
+                changed.push_back(it->label);
+                it = pending.erase(it);
+            }
+        }
+    }
+
+    outcome.changed = join_labels(changed);
+    if (pending.empty())
+        return true;
+
+    for (const auto& p : pending) {
+        if (!outcome.unverified.empty())
+            outcome.unverified += "; ";
+        outcome.unverified += p.label + " was asked for " + temp_text(p.want_min) + " / " + temp_text(p.want_max) +
+                              " C and still reports " + temp_text(p.read_min) + " / " + temp_text(p.read_max) + " C";
+    }
+    return false;
+}
+
+bool CrealityCFS::handle_slot_temp_failure(const SlotTempOutcome& outcome,
+                                           bool                   will_start_print,
+                                           const ErrorFn&         error_fn,
+                                           const InfoFn&          info_fn) const
+{
+    const std::string detail = outcome.transport.empty() ? outcome.unverified : outcome.transport;
+
+    // Earlier slots in the same run may already be at the job's temperature, and
+    // the user has to know that before deciding what to do about the rest.
+    wxString changed_note;
+    if (!outcome.changed.empty())
+        changed_note = "\n" + wxString::Format(_L("CFS slot(s) %s were already set to this job's temperature."),
+                                               wxString::FromUTF8(outcome.changed.c_str()));
+
+    if (will_start_print) {
+        error_fn(wxString::Format(_L("The printer did not accept a new CFS slot temperature (%s). "
+                                     "The print was not started, so nothing has moved. "
+                                     "Set the slot's material on the touchscreen, or clear \"Set the CFS slot "
+                                     "temperature from this job\" in the send dialog to print without this step.%s"),
+                                  wxString::FromUTF8(detail.c_str()), changed_note));
+        return false;
+    }
+
+    BOOST_LOG_TRIVIAL(warning) << "CrealityCFS: the file was uploaded but the printer did not accept a new CFS slot "
+                                  "temperature ("
+                               << detail << ")"
+                               << (outcome.changed.empty() ? std::string() :
+                                                             "; already changed: " + outcome.changed);
+    if (info_fn)
+        info_fn(L"complete_with_warning",
+                wxString::Format(_L("The file was uploaded. The printer did not accept a new CFS slot temperature "
+                                    "(%s). Set the slot's material on the touchscreen before printing this file.%s"),
+                                 wxString::FromUTF8(detail.c_str()), changed_note));
+    return true;
+}
+
 // -- start ---------------------------------------------------------------
 
 bool CrealityCFS::start_job(const std::string& abs_path, const std::string& colormatch_json, int self_test, wxString& msg) const
@@ -1150,7 +1661,38 @@ bool CrealityCFS::upload(PrintHostUpload upload_data, ProgressFn progress_fn, Er
         return false;
     }
 
-    if (upload_data.post_action != PrintHostPostUploadAction::StartPrint)
+    const std::string colormatch_json = upload_data.extended(EXTENDED_COLORMATCH);
+
+    const bool will_start_print = upload_data.post_action == PrintHostPostUploadAction::StartPrint;
+
+    // Before anything else: raise the mapped slots' own temperature to the job's.
+    // This runs whether or not a print is being started, because a slot is just
+    // as wrong when the user prints the file from the touchscreen later; only
+    // what a failure means differs, which handle_slot_temp_failure decides. An
+    // absent key means yes, because the dialog's checkbox is on by default and a
+    // host without that dialog still wants the slot hot enough.
+    if (!colormatch_json.empty() && upload_data.extended(EXTENDED_SYNC_SLOT_TEMP, "1") != "0") {
+        if (!is_plain_text_gcode(upload_data.source_path)) {
+            const std::string ext = upload_data.source_path.extension().string();
+            BOOST_LOG_TRIVIAL(info) << name << ": slot temperature sync skipped: "
+                                    << (ext.empty() ? std::string("a file with no extension") : ext)
+                                    << " is not plain-text G-code";
+        } else {
+            const std::vector<int> job_temps =
+                parse_nozzle_temperatures(read_file_tail(upload_data.source_path, CFS_GCODE_TAIL_BYTES));
+            if (job_temps.empty()) {
+                BOOST_LOG_TRIVIAL(info) << name << ": the G-code names no nozzle temperature, so the CFS slots were "
+                                                   "left alone";
+            } else {
+                SlotTempOutcome outcome;
+                if (!sync_slot_temperatures(colormatch_json, job_temps, info_fn, outcome) &&
+                    !handle_slot_temp_failure(outcome, will_start_print, error_fn, info_fn))
+                    return false;
+            }
+        }
+    }
+
+    if (!will_start_print)
         return true;
 
     std::string root;
@@ -1159,12 +1701,6 @@ bool CrealityCFS::upload(PrintHostUpload upload_data, ProgressFn progress_fn, Er
     const std::string abs_path = root + "/" + filename;
     BOOST_LOG_TRIVIAL(info) << name << ": starting " << abs_path;
 
-    std::string colormatch_json;
-    {
-        auto it = upload_data.extended_info.find(EXTENDED_COLORMATCH);
-        if (it != upload_data.extended_info.end())
-            colormatch_json = it->second;
-    }
     int self_test = 0;
     {
         auto it = upload_data.extended_info.find(EXTENDED_SELFTEST);

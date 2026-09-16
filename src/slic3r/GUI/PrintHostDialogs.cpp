@@ -2280,30 +2280,43 @@ void CfsPrintHostSendDialog::init()
         return;
     }
 
-    // Calibration checkbox.
+    // Calibration and slot temperature checkboxes. Both remember their state in
+    // the app config, so the dialog opens the way it was last left.
     {
         const AppConfig* app_config = wxGetApp().app_config;
-        std::string      saved      = app_config->get("recent", CONFIG_KEY_CFS_SELFTEST);
-        if (!saved.empty()) {
+        auto remembered = [app_config](const char* key, bool fallback) {
+            const std::string saved = app_config->get("recent", key);
+            if (saved.empty())
+                return fallback;
             try {
-                m_self_test = std::stoi(saved) != 0;
-            } catch (...) {}
-        }
+                return std::stoi(saved) != 0;
+            } catch (...) {
+                return fallback;
+            }
+        };
+        m_self_test      = remembered(CONFIG_KEY_CFS_SELFTEST, m_self_test);
+        m_sync_slot_temp = remembered(CONFIG_KEY_CFS_SYNC_SLOT_TEMP, m_sync_slot_temp);
 
-        auto* checkbox_sizer = new wxBoxSizer(wxHORIZONTAL);
-        auto* checkbox       = new ::CheckBox(this);
-        checkbox->SetValue(m_self_test);
-        checkbox->Bind(wxEVT_TOGGLEBUTTON, [this](wxCommandEvent& e) {
-            m_self_test = e.IsChecked();
-            wxGetApp().app_config->set("recent", CONFIG_KEY_CFS_SELFTEST, m_self_test ? "1" : "0");
-            e.Skip();
-        });
-        checkbox_sizer->Add(checkbox, 0, wxALL | wxALIGN_CENTER, FromDIP(2));
-        auto* checkbox_text = new wxStaticText(this, wxID_ANY, _L("Calibrate before printing"));
-        checkbox_text->SetFont(::Label::Body_13);
-        checkbox_text->SetForegroundColour(StateColor::darkModeColorFor(wxColour("#323A3D")));
-        checkbox_sizer->Add(checkbox_text, 0, wxALL | wxALIGN_CENTER, FromDIP(2));
-        group_sizer->Add(checkbox_sizer);
+        auto add_checkbox = [this, group_sizer](const wxString& label, const char* key, bool* target) {
+            auto* checkbox_sizer = new wxBoxSizer(wxHORIZONTAL);
+            auto* checkbox       = new ::CheckBox(this);
+            checkbox->SetValue(*target);
+            checkbox->Bind(wxEVT_TOGGLEBUTTON, [target, key](wxCommandEvent& e) {
+                *target = e.IsChecked();
+                wxGetApp().app_config->set("recent", key, *target ? "1" : "0");
+                e.Skip();
+            });
+            checkbox_sizer->Add(checkbox, 0, wxALL | wxALIGN_CENTER, FromDIP(2));
+            auto* checkbox_text = new wxStaticText(this, wxID_ANY, label);
+            checkbox_text->SetFont(::Label::Body_13);
+            checkbox_text->SetForegroundColour(StateColor::darkModeColorFor(wxColour("#323A3D")));
+            checkbox_sizer->Add(checkbox_text, 0, wxALL | wxALIGN_CENTER, FromDIP(2));
+            group_sizer->Add(checkbox_sizer);
+        };
+
+        add_checkbox(_L("Calibrate before printing"), CONFIG_KEY_CFS_SELFTEST, &m_self_test);
+        add_checkbox(_L("Set the CFS slot temperature from this job"), CONFIG_KEY_CFS_SYNC_SLOT_TEMP,
+                     &m_sync_slot_temp);
         group_sizer->AddSpacer(VERT_SPACING);
     }
 
@@ -2454,7 +2467,8 @@ void CfsPrintHostSendDialog::init()
 std::map<std::string, std::string> CfsPrintHostSendDialog::extendedInfo() const
 {
     std::map<std::string, std::string> info;
-    info[CrealityCFS::EXTENDED_SELFTEST] = m_self_test ? "1" : "0";
+    info[CrealityCFS::EXTENDED_SELFTEST]       = m_self_test ? "1" : "0";
+    info[CrealityCFS::EXTENDED_SYNC_SLOT_TEMP] = m_sync_slot_temp ? "1" : "0";
 
     json list = json::array();
     for (int i = 0; i < (int) m_slot_combos.size(); i++) {
