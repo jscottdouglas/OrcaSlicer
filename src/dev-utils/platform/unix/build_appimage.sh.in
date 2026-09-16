@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 APPIMAGETOOLURL="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$(uname -m).AppImage"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
+# CMake configures this script into the build directory, not next to the
+# template, so the checkout cannot be derived from the script's own location:
+# ${SCRIPT_DIR}/../../.. resolved to the grandparent of the checkout and the
+# metainfo copies below silently failed. Substitute the source tree instead.
+REPO_ROOT="@CMAKE_SOURCE_DIR@"
 
 
 APP_IMAGE="@SLIC3R_APP_KEY@_Linux_V@SoftFever_VERSION@.AppImage"
