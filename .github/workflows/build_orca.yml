@@ -606,8 +606,14 @@ jobs:
           # (x86_64 + aarch64) gets tested by its own unit_tests_linux_* job.
           ./build_linux.sh -istrlL
           ./scripts/check_appimage_libs.sh ./build/package ./build/package/bin/orca-slicer
+          # build_appimage.sh names the AppImage after SLIC3R_APP_KEY in
+          # version.inc (the source of truth for the product key), so read it
+          # from there instead of hardcoding it. The destination keeps the
+          # OrcaSlicer_Linux_AppImage* artifact name the upload and release
+          # steps below already match on.
+          app_key=$(grep 'set(SLIC3R_APP_KEY' version.inc | cut -d '"' -f2)
           appimage=./build/OrcaSlicer_Linux_AppImage${{ env.ubuntu-ver-str }}${{ env.arch_suffix }}_${{ env.ver }}.AppImage
-          mv -n ./build/OrcaSlicer_Linux_V${{ env.ver_pure }}.AppImage "$appimage"
+          mv -n "./build/${app_key}_Linux_V${{ env.ver_pure }}.AppImage" "$appimage"
           chmod +x "$appimage"
           tar -cvf build_tests.tar build/tests
 
