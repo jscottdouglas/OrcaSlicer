@@ -1068,6 +1068,10 @@ bool CrealityCFS::query_slot_table(CfsSlotTable& table, std::string& error) cons
                                 raw = std::to_string(t.get<long long>());
                             if (raw == "unknown" && !slot->type.empty())
                                 slot->edited = true;
+                            // An untagged spool the printer is not tracking reads 0 m:
+                            // that is "unknown", not "empty". A tracked one keeps its figure.
+                            if (raw == "unknown" && slot->remain_len == 0.0)
+                                slot->remain_len = -1.0;
                         }
                     }
                 }
