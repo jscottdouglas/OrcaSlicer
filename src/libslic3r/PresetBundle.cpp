@@ -4511,6 +4511,32 @@ static void warn_ambiguous_filament_id_match(const PresetCollection &filaments, 
                                    << "\", also matches " << others;
 }
 
+// Orca CFS fork: a synced CFS spool resolves to a system base preset, but Creality K2 owners
+// keep calibrated copies of those (e.g. "Panchroma PLA Matte @K2 Plus" over the stock
+// "Panchroma PLA Matte @K2 Plus-all"). When exactly one visible user preset derives from a
+// base with this filament_id, pick it; with several the choice is ambiguous, so keep the base.
+static PresetCollection::Iterator prefer_sole_user_child(PresetCollection &filaments, PresetCollection::Iterator match, const std::string &filament_id)
+{
+    if (match == filaments.end())
+        return match;
+    auto found = filaments.end();
+    for (auto it = filaments.begin(); it != filaments.end(); ++it) {
+        if (!it->is_user() || it->is_external || !it->is_visible || !it->is_compatible)
+            continue;
+        const Preset *base = filaments.get_preset_base(*it);
+        if (base == nullptr || base == &*it || base->filament_id != filament_id)
+            continue;
+        if (found != filaments.end())
+            return match;
+        found = it;
+    }
+    if (found == filaments.end())
+        return match;
+    BOOST_LOG_TRIVIAL(info) << "CFS sync: filament_id \"" << filament_id << "\" uses the user preset \"" << found->name
+                            << "\" derived from \"" << match->name << "\"";
+    return found;
+}
+
 void PresetBundle::get_ams_cobox_infos(AMSComboInfo& combox_info)
 {
     combox_info.clear();
@@ -4637,6 +4663,9 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
             has_type |= f.config.opt_string("filament_type", 0u) == filament_type;
             return f.is_compatible && filaments.get_preset_base(f) == &f && f.filament_id == filament_id; });
         warn_ambiguous_filament_id_match(filaments, iter, filament_id);
+        if (const auto *agent = printers.get_edited_preset().config.option<ConfigOptionString>("printer_agent");
+            agent != nullptr && agent->value == "crealityprint")
+            iter = prefer_sole_user_child(filaments, iter, filament_id);
         if (iter == filaments.end()) {
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": filament_id %1% not found or system or compatible") % filament_id;
             if (!filament_type.empty()) {
