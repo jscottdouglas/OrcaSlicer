@@ -455,6 +455,76 @@ std::string modify_material_message(const CfsSlot& slot, double min_temp, double
     return message.dump();
 }
 
+// A box object entry as text: the K2 reports strings, but an older firmware or
+// a hand-built fixture may hand over a number.
+std::string box_entry(const json& list, int index)
+{
+    if (!list.is_array() || index >= int(list.size()))
+        return {};
+    const json& v = list[index];
+    if (v.is_string())
+        return v.get<std::string>();
+    if (v.is_number())
+        return std::to_string(v.get<long long>());
+    return {};
+}
+
+// Merge Moonraker's box object into a slot table read from boxsInfo: the
+// G-code-slot map, each slot's remaining length, and whether the type came
+// from a manual edit.
+void merge_box(const json& box, CfsSlotTable& table)
+{
+    if (box.contains("map") && box["map"].is_object())
+        for (auto it = box["map"].begin(); it != box["map"].end(); ++it)
+            if (it.value().is_string())
+                table.gcode_map[it.key()] = it.value().get<std::string>();
+
+    for (int unit = 1; unit <= MAX_UNITS; ++unit) {
+        const std::string key = "T" + std::to_string(unit);
+        if (!box.contains(key) || !box[key].is_object())
+            continue;
+        const json& u       = box[key];
+        const json  remains = u.contains("remain_len") ? u["remain_len"] : json::array();
+        const json  types   = u.contains("material_type") ? u["material_type"] : json::array();
+        const json  venders = u.contains("vender") ? u["vender"] : json::array();
+        for (int mid = 0; mid < SLOTS_PER_UNIT; ++mid) {
+            CfsSlot* slot = nullptr;
+            for (auto& s : table.slots)
+                if (s.unit == unit && s.slot == mid)
+                    slot = &s;
+            if (slot == nullptr)
+                continue;
+            if (remains.is_array() && mid < int(remains.size())) {
+                double value = -1.0;
+                const json& r = remains[mid];
+                if (r.is_number())
+                    value = r.get<double>();
+                else if (r.is_string()) {
+                    try {
+                        value = std::stod(r.get<std::string>());
+                    } catch (...) {
+                        value = -1.0;
+                    }
+                }
+                slot->remain_len = value >= 0.0 ? value : -1.0;
+            }
+            if (types.is_array() && mid < int(types.size())) {
+                const std::string raw = box_entry(types, mid);
+                if (raw == "unknown" && !slot->type.empty())
+                    slot->edited = true;
+                // An untagged spool the printer is not tracking reads 0 m:
+                // that is "unknown", not "empty". A tracked one keeps its figure.
+                // Newer firmware keeps a hand-set material code there ("000003")
+                // and says "unknown" in vender instead, which is how 3A, 3B and
+                // 3C read on 2026-10-19. The bridge (slots.py) uses the same rule.
+                const bool untagged = raw == "unknown" || box_entry(venders, mid) == "unknown";
+                if (untagged && slot->remain_len == 0.0)
+                    slot->remain_len = -1.0;
+            }
+        }
+    }
+}
+
 } // namespace
 
 // -- helpers -------------------------------------------------------------
@@ -1026,55 +1096,7 @@ bool CrealityCFS::query_slot_table(CfsSlotTable& table, std::string& error) cons
             BOOST_LOG_TRIVIAL(info) << "CrealityCFS: " << box_error << "; remaining length will not be shown";
         } else {
             try {
-                if (box.contains("map") && box["map"].is_object())
-                    for (auto it = box["map"].begin(); it != box["map"].end(); ++it)
-                        if (it.value().is_string())
-                            table.gcode_map[it.key()] = it.value().get<std::string>();
-
-                for (int unit = 1; unit <= MAX_UNITS; ++unit) {
-                    const std::string key = "T" + std::to_string(unit);
-                    if (!box.contains(key) || !box[key].is_object())
-                        continue;
-                    const json& u       = box[key];
-                    const json  remains = u.contains("remain_len") ? u["remain_len"] : json::array();
-                    const json  types   = u.contains("material_type") ? u["material_type"] : json::array();
-                    for (int mid = 0; mid < SLOTS_PER_UNIT; ++mid) {
-                        CfsSlot* slot = nullptr;
-                        for (auto& s : table.slots)
-                            if (s.unit == unit && s.slot == mid)
-                                slot = &s;
-                        if (slot == nullptr)
-                            continue;
-                        if (remains.is_array() && mid < int(remains.size())) {
-                            double value = -1.0;
-                            const json& r = remains[mid];
-                            if (r.is_number())
-                                value = r.get<double>();
-                            else if (r.is_string()) {
-                                try {
-                                    value = std::stod(r.get<std::string>());
-                                } catch (...) {
-                                    value = -1.0;
-                                }
-                            }
-                            slot->remain_len = value >= 0.0 ? value : -1.0;
-                        }
-                        if (types.is_array() && mid < int(types.size())) {
-                            std::string raw;
-                            const json& t = types[mid];
-                            if (t.is_string())
-                                raw = t.get<std::string>();
-                            else if (t.is_number())
-                                raw = std::to_string(t.get<long long>());
-                            if (raw == "unknown" && !slot->type.empty())
-                                slot->edited = true;
-                            // An untagged spool the printer is not tracking reads 0 m:
-                            // that is "unknown", not "empty". A tracked one keeps its figure.
-                            if (raw == "unknown" && slot->remain_len == 0.0)
-                                slot->remain_len = -1.0;
-                        }
-                    }
-                }
+                merge_box(box, table);
             } catch (const std::exception& e) {
                 BOOST_LOG_TRIVIAL(info) << "CrealityCFS: could not parse the Moonraker box object: " << e.what();
             }
@@ -1085,6 +1107,17 @@ bool CrealityCFS::query_slot_table(CfsSlotTable& table, std::string& error) cons
         return a.unit != b.unit ? a.unit < b.unit : a.slot < b.slot;
     });
     return true;
+}
+
+bool CrealityCFS::merge_box_object(const std::string& box_json, CfsSlotTable& table)
+{
+    try {
+        merge_box(json::parse(box_json), table);
+        return true;
+    } catch (const std::exception& e) {
+        BOOST_LOG_TRIVIAL(info) << "CrealityCFS: could not parse the Moonraker box object: " << e.what();
+        return false;
+    }
 }
 
 // -- the G-code root -----------------------------------------------------

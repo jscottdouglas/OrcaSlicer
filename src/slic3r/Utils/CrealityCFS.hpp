@@ -121,6 +121,13 @@ public:
     // Read boxsInfo over ws://<ip>:9999 and merge Moonraker's box object into it.
     bool query_slot_table(CfsSlotTable& table, std::string& error) const;
 
+    // Merge Moonraker's box object, as JSON text, into a table already read from
+    // boxsInfo: the G-code-slot map, remaining length, and the manual edit flag.
+    // A spool the printer is not tracking (material_type or vender "unknown")
+    // that reads 0 m gets a negative remain_len, meaning unknown, not empty.
+    // False when the text is not valid JSON; the table is then left unchanged.
+    static bool merge_box_object(const std::string& box_json, CfsSlotTable& table);
+
     // The bare IP, with any scheme and port stripped. Port 80 and port 9999 are
     // fixed by the firmware, so a print_host carrying some other port (a Moonraker
     // 7125 address, say) still works.
